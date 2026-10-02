@@ -5,7 +5,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
 
-from qrs.api import create_app
 from qrs.models import CommitCode
 
 
@@ -98,7 +97,7 @@ def test_concurrent_duplicate_submits_apply_once(client: TestClient) -> None:
     with ThreadPoolExecutor(max_workers=8) as pool:
         direct = list(pool.map(
             lambda i: cluster.coordinator.commit(
-                f"ik-direct", "k2", "v2", f"dreq-{i}", timestamp=200,
+                "ik-direct", "k2", "v2", f"dreq-{i}", timestamp=200,
             ),
             range(n),
         ))

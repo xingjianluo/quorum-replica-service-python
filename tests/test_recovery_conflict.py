@@ -103,25 +103,36 @@ def test_conflict_queryable_after_full_restart(client: TestClient) -> None:
 
 
 def test_minority_residue_not_visible_after_restart(client: TestClient) -> None:
-    """未达多数派的写入重启后仍是少数派残留，不可见。"""
-    client.post("/cluster/fault/replica-1")
+    """未达多数派的写入在条件未恢复时仍是少数派残留，不可见；恢复后自动收敛。"""
+    # replica-1 宕机、replica-2 存活但写失败：仅 replica-0 确认 -> 504
+    client.post("/cluster/fail/replica-1")
     client.post("/cluster/fault/replica-2")
     client.post("/writes", json={
         "idem_key": "ik-fail", "key": "k1", "value": "minority",
         "request_id": "req-fail", "timestamp": 1,
     })
-    # 全部重启，replica-0 上的残留依然存在但不应被读为可见
-    for rid in ("replica-0", "replica-1", "replica-2"):
-        client.post(f"/cluster/restart/{rid}")
+    # 仅重启协调者（故障条件仍在）：残留依然存在但不应被读为可见，
+    # 状态查询明确为 WAITING，并指出卡在存活/确认副本不足。
     client.post("/cluster/restart-coordinator")
     read = client.get("/keys/k1").json()
     assert read["visible"] is False
     assert read["committed_replicas"] == []
-    # 补复制后收敛可见
-    client.post("/cluster/clear-fault/replica-1")
+    status = client.get("/writes/ik-fail/status").json()
+    assert status["status"] == "WAITING"
+    assert status["readable"] is False
+    assert status["acked_replicas"] == []
+    assert "replica-1" in status["pending_replicas"]
+
+    # 副本恢复（宕机者重启、故障解除）：无需手工 resume，自动对账补齐并收敛
+    client.post("/cluster/restart/replica-1")
     client.post("/cluster/clear-fault/replica-2")
-    client.post("/writes/ik-fail/resume")
+    assert client.get("/writes/ik-fail/status").json()["status"] == "SUCCESS"
     assert client.get("/keys/k1").json()["visible"] is True
+    # 全部副本再重启一遍，最终状态仍是同一已提交值，不重复生效
+    for rid in ("replica-0", "replica-1", "replica-2"):
+        client.post(f"/cluster/restart/{rid}")
+    assert client.get("/keys/k1").json()["visible"] is True
+    assert client.get("/keys/k1").json()["value"] == "minority"
 
 
 def test_concurrent_conflicting_writes_resolve_deterministically(client: TestClient) -> None:

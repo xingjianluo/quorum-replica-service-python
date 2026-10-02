@@ -33,11 +33,16 @@ class Cluster:
             )
             for i in range(self.n)
         ]
+        # 目录中可能存在升级前留下的 WAL：重放恢复，空文件则为 no-op。
+        for rep in self.replicas:
+            rep.recover()
         self.coordinator = Coordinator(
             self.replicas,
             JsonlLog(os.path.join(self.base_dir, "coordinator.log")),
         )
         self.coordinator.recover()
+        self.coordinator.verify()
+        self.coordinator.reconcile()
 
     def fail_replica(self, replica_id: str) -> None:
         """令某个副本故障（宕机；后续复制/读取对其失败）。"""
@@ -53,12 +58,13 @@ class Cluster:
         print(f"[cluster] {replica_id} write-fault injected", flush=True)
 
     def clear_write_fault(self, replica_id: str) -> None:
-        """解除写入故障注入。"""
+        """解除写入故障注入，并立即自动对账补齐该副本缺口。"""
         self._find(replica_id).fault_write = False
         print(f"[cluster] {replica_id} write-fault cleared", flush=True)
+        self.coordinator.reconcile()
 
     def restart_replica(self, replica_id: str) -> Replica:
-        """重启某个副本：丢弃内存状态，仅从本地 WAL 重放恢复。"""
+        """重启某个副本：丢弃内存状态，仅从本地 WAL 重放恢复，随后自动对账。"""
         idx = next(
             i for i, r in enumerate(self.replicas) if r.replica_id == replica_id
         )
@@ -73,10 +79,13 @@ class Cluster:
             f"{len(rep.data)} keys / {len(rep.seen_requests)} requests",
             flush=True,
         )
+        # 重启者可能落后于集群：自动把缺口补齐并推进未达多数派的写入。
+        self.coordinator.reconcile()
         return rep
 
     def restart_coordinator(self) -> Coordinator:
-        """重启协调者：从提交日志重放幂等表、从副本 WAL 重建冲突历史。"""
+        """重启协调者：从提交日志重放幂等表/账本、从副本 WAL 重建冲突历史，
+        然后跑一次恢复校验与自动对账（旧版本落盘数据同样可启动并收敛）。"""
         self.coordinator = Coordinator(
             self.replicas,
             JsonlLog(os.path.join(self.base_dir, "coordinator.log")),
@@ -87,6 +96,8 @@ class Cluster:
             f"{len(self.coordinator.idem_table)} idem keys / "
             f"{len(self.coordinator.conflicts)} conflicts", flush=True,
         )
+        self.coordinator.verify()
+        self.coordinator.reconcile()
         return self.coordinator
 
     def cleanup(self) -> None:

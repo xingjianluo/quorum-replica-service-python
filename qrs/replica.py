@@ -11,8 +11,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from qrs.models import CONFLICT_RULE, ConflictRecord
+from qrs.models import (
+    CONFLICT_RULE,
+    WAL_VERSION,
+    WAL_VERSION_V1,
+    ConflictRecord,
+)
 from qrs.storage import JsonlLog
+
+_WRITE_FIELDS = ("key", "value", "request_id", "timestamp")
 
 
 @dataclass
@@ -40,21 +47,55 @@ class Replica:
         self.fault_write = False  # 故障注入：写入抛错，但实例仍存活
         self.data: dict[str, ReplicaState] = {}
         self.seen_requests: set[str] = set()
+        # 重放旧/异常落盘数据时发现的可解释问题（不阻断启动）。
+        self.recovery_anomalies: list[str] = []
 
     # 恢复 -------------------------------------------------------------
     def recover(self) -> None:
-        """从本地 WAL 重放恢复状态（重复/乱序记录同样收敛）。"""
-        for rec in self.log.read_all():
-            op = rec.get("op")
-            if op == "write":
-                self._ingest(
-                    rec["key"], rec["value"], rec["request_id"],
-                    rec["timestamp"], rec["committed"],
+        """从本地 WAL 重放恢复状态（v1/v2 记录归一化，重复/乱序同样收敛）。"""
+        records, skipped = self.log.read_all_with_errors()
+        for item in skipped:
+            self.recovery_anomalies.append(f"replica {self.replica_id}: {item}")
+        for rec in records:
+            self._replay_record(rec)
+
+    def _replay_record(self, rec: dict) -> None:
+        op = rec.get("op")
+        version = rec.get("v", WAL_VERSION_V1)  # 缺省视为历史 v1
+        if op == "write":
+            missing = [f for f in _WRITE_FIELDS if f not in rec]
+            if missing:
+                self.recovery_anomalies.append(
+                    f"replica {self.replica_id}: write 记录缺少字段 {missing}，"
+                    f"已跳过该记录（request_id={rec.get('request_id')!r}）"
                 )
-            elif op == "commit":
-                state = self.data.get(rec["key"])
-                if state is not None and state.request_id == rec["request_id"]:
-                    state.committed = True
+                return
+            self._ingest(
+                rec["key"], rec["value"], rec["request_id"],
+                rec["timestamp"], bool(rec.get("committed", False)),
+            )
+        elif op == "commit":
+            state = self.data.get(rec.get("key"))
+            if state is None:
+                self.recovery_anomalies.append(
+                    f"replica {self.replica_id}: commit 标记 request_id="
+                    f"{rec.get('request_id')!r} 找不到对应 write 记录"
+                    f"（key={rec.get('key')!r}，可能来自未同步的落后数据），已忽略"
+                )
+                return
+            if state.request_id != rec["request_id"]:
+                self.recovery_anomalies.append(
+                    f"replica {self.replica_id}: commit 标记 request_id="
+                    f"{rec.get('request_id')!r} 不属于该键当前获胜写入 "
+                    f"{state.request_id}，不覆盖已确认状态，已忽略"
+                )
+                return
+            state.committed = True
+        else:
+            self.recovery_anomalies.append(
+                f"replica {self.replica_id}: 未知 op={op!r}（format v{version}），"
+                f"已跳过"
+            )
 
     # 复制写入 ----------------------------------------------------------
     def apply_write(
@@ -69,8 +110,9 @@ class Replica:
         if not self.alive:
             raise RuntimeError(f"replica {self.replica_id} is down")
         if self.fault_write:
-            raise IOError(f"replica {self.replica_id} injected write fault")
+            raise OSError(f"replica {self.replica_id} injected write fault")
         record = {
+            "v": WAL_VERSION,
             "op": "write", "key": key, "value": value,
             "request_id": request_id, "timestamp": timestamp,
             "committed": committed,
@@ -91,7 +133,7 @@ class Replica:
             return
         if state.committed:
             return
-        self.log.append({"op": "commit", "key": key, "request_id": request_id})
+        self.log.append({"v": WAL_VERSION, "op": "commit", "key": key, "request_id": request_id})
         state.committed = True
 
     # 查询 -------------------------------------------------------------
@@ -99,6 +141,10 @@ class Replica:
         if not self.alive:
             raise RuntimeError(f"replica {self.replica_id} is down")
         return self.data.get(key)
+
+    def has_request(self, request_id: str) -> bool:
+        """该副本是否已接收过去重后的某个写入（对账时判断缺口）。"""
+        return request_id in self.seen_requests
 
     # 内部 -------------------------------------------------------------
     def _ingest(

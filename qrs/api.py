@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from qrs.cluster import Cluster
-from qrs.models import CommitCode, CommitOutcome, ConflictRecord
+from qrs.models import CommitCode, CommitOutcome, ConflictRecord, WriteStatusView
 
 _CODE_TO_HTTP = {
     CommitCode.COMMITTED: 200,
@@ -65,6 +65,25 @@ def _conflict_dict(c: ConflictRecord) -> dict[str, Any]:
     }
 
 
+def _status_dict(s: WriteStatusView) -> dict[str, Any]:
+    return {
+        "idem_key": s.idem_key,
+        "request_id": s.request_id,
+        "key": s.key,
+        "value": s.value,
+        "timestamp": s.timestamp,
+        "status": s.status.value,
+        "code": s.code.value,
+        "step": s.step,
+        "acked_replicas": s.acked,
+        "pending_replicas": s.pending,
+        "quorum": s.quorum,
+        "readable": s.readable,
+        "superseded_by": s.superseded_by,
+        "basis": s.basis,
+    }
+
+
 def create_app(cluster: Cluster | None = None) -> FastAPI:
     """构造 FastAPI 应用，允许注入集群（测试用）。"""
     app = FastAPI(title="quorum-replica-service")
@@ -90,6 +109,33 @@ def create_app(cluster: Cluster | None = None) -> FastAPI:
         if outcome is None:
             raise HTTPException(status_code=404, detail=f"未知幂等键: {idem_key}")
         return _outcome_dict(outcome)
+
+    @app.get("/writes/{idem_key}/status")
+    def write_status(idem_key: str) -> dict[str, Any]:
+        view = coord().write_status(idem_key)
+        if view is None:
+            raise HTTPException(status_code=404, detail=f"未知幂等键: {idem_key}")
+        return _status_dict(view)
+
+    @app.get("/writes")
+    def list_pending_writes() -> dict[str, Any]:
+        views = coord().list_pending()
+        return {"count": len(views), "writes": [_status_dict(v) for v in views]}
+
+    @app.post("/writes/reconcile")
+    def reconcile_writes() -> dict[str, Any]:
+        result = coord().reconcile()
+        return {
+            "backfilled": result.backfilled,
+            "upgraded": result.upgraded,
+            "failed": result.failed,
+            "waiting": result.waiting,
+            "conflicts": result.conflicts,
+        }
+
+    @app.get("/cluster/verify")
+    def cluster_verify() -> dict[str, Any]:
+        return coord().verify()
 
     @app.post("/writes/{idem_key}/resume")
     def resume_write(idem_key: str) -> JSONResponse:
