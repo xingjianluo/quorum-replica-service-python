@@ -10,16 +10,24 @@ import shutil
 import tempfile
 
 from qrs.coordinator import Coordinator
+from qrs.reconcile import Reconciler, ReconcileReport
 from qrs.replica import Replica
 from qrs.storage import JsonlLog
 
 
 class Cluster:
-    """持有 N 个副本与 1 个协调者，支持故障注入与重启恢复。"""
+    """持有 N 个副本与 1 个协调者，支持故障注入、重启恢复与自动对账。"""
 
-    def __init__(self, base_dir: str | None = None, n: int = 3) -> None:
+    def __init__(
+        self,
+        base_dir: str | None = None,
+        n: int = 3,
+        auto_reconcile: bool = False,
+    ) -> None:
         self.base_dir = base_dir or tempfile.mkdtemp(prefix="qrs-")
         self.n = n
+        # 开启后：副本重启/故障解除时自动触发一轮对账，无需人工介入
+        self.auto_reconcile = auto_reconcile
         os.makedirs(self.base_dir, exist_ok=True)
         self.replicas: list[Replica] = []
         self.coordinator: Coordinator | None = None
@@ -33,6 +41,9 @@ class Cluster:
             )
             for i in range(self.n)
         ]
+        # 启动即重放各自 WAL（含历史 v0 格式数据），恢复已提交状态
+        for rep in self.replicas:
+            rep.recover()
         self.coordinator = Coordinator(
             self.replicas,
             JsonlLog(os.path.join(self.base_dir, "coordinator.log")),
@@ -56,6 +67,7 @@ class Cluster:
         """解除写入故障注入。"""
         self._find(replica_id).fault_write = False
         print(f"[cluster] {replica_id} write-fault cleared", flush=True)
+        self._maybe_auto_reconcile(f"fault-cleared:{replica_id}")
 
     def restart_replica(self, replica_id: str) -> Replica:
         """重启某个副本：丢弃内存状态，仅从本地 WAL 重放恢复。"""
@@ -73,6 +85,7 @@ class Cluster:
             f"{len(rep.data)} keys / {len(rep.seen_requests)} requests",
             flush=True,
         )
+        self._maybe_auto_reconcile(f"replica-restarted:{replica_id}")
         return rep
 
     def restart_coordinator(self) -> Coordinator:
@@ -95,6 +108,16 @@ class Cluster:
 
     def alive_replicas(self) -> list[Replica]:
         return [r for r in self.replicas if r.alive]
+
+    def reconcile(self) -> ReconcileReport:
+        """触发一轮自动对账：续推未决写入 + 补齐落后副本。"""
+        return Reconciler(self.coordinator).reconcile_once()
+
+    def _maybe_auto_reconcile(self, trigger: str) -> None:
+        if not self.auto_reconcile:
+            return
+        print(f"[cluster] auto-reconcile triggered by {trigger}", flush=True)
+        self.reconcile()
 
     @property
     def quorum(self) -> int:

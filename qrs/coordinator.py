@@ -12,9 +12,14 @@ from __future__ import annotations
 
 import itertools
 import threading
-from typing import Callable
+from collections.abc import Callable
 
-from qrs.models import CONFLICT_RULE, CommitCode, CommitOutcome, ConflictRecord
+from qrs.compat import (
+    normalize_coordinator_record,
+    normalize_replica_record,
+    validate_recovered,
+)
+from qrs.models import CommitCode, CommitOutcome, ConflictRecord
 from qrs.replica import Replica
 from qrs.storage import JsonlLog
 
@@ -45,24 +50,47 @@ class Coordinator:
 
     # 恢复 -------------------------------------------------------------
     def recover(self) -> None:
-        """从协调者本地持久化恢复幂等表，并从各副本 WAL 重建冲突历史。"""
+        """从协调者本地持久化恢复幂等表，并从各副本 WAL 重建冲突历史。
+
+        旧格式（v0）记录经 compat 规范化后按当前语义恢复；无法识别的记录
+        跳过并记日志，不影响已确认数据。
+        """
         with self._lock:
             self.idem_table = {}
-            for rec in self.commit_log.read_all():
+            skipped = 0
+            for raw in self.commit_log.read_all():
+                rec = normalize_coordinator_record(raw)
+                if rec is None:
+                    skipped += 1
+                    print(
+                        f"[recover] coordinator 跳过无法识别的记录: {raw}",
+                        flush=True,
+                    )
+                    continue
                 self.idem_table[rec["idem_key"]] = CommitOutcome(
                     idem_key=rec["idem_key"],
                     code=CommitCode(rec["code"]),
                     request_id=rec["request_id"],
-                    key=rec.get("key", ""),
+                    key=rec["key"],
                     value=rec["value"],
-                    acked=list(rec.get("acked", [])),
-                    pending=list(rec.get("pending", [])),
-                    quorum=rec.get("quorum", 0),
-                    reason=rec.get("reason", ""),
-                    replay=rec.get("replay", False),
-                    timestamp=rec.get("timestamp"),
+                    acked=rec["acked"],
+                    pending=rec["pending"],
+                    # v0 记录没有 quorum 字段：迁移为当前多数派，
+                    # 避免 resume/状态查询按 0 判定
+                    quorum=rec["quorum"] or self.quorum,
+                    reason=rec["reason"],
+                    replay=rec["replay"],
+                    timestamp=rec["timestamp"],
                 )
             self.conflicts = self._rebuild_conflicts()
+            validate_recovered(
+                len(self.idem_table), len(self.idem_table), "coordinator",
+            )
+            if skipped:
+                print(
+                    f"[recover] coordinator skipped={skipped} "
+                    f"basis=无法识别的记录不影响已确认判定", flush=True,
+                )
 
     def _rebuild_conflicts(self) -> list[ConflictRecord]:
         """把每个副本的 WAL 重放进一个临时副本，重新导出确定性的冲突记录。"""
@@ -71,8 +99,9 @@ class Coordinator:
             # 按 WAL 顺序把 write 记录重放进临时副本，重新导出确定性冲突。
             tmp = Replica(rep.replica_id, JsonlLog(rep.log.path + ".replay-tmp"))
             try:
-                for rec in rep.log.read_all():
-                    if rec.get("op") != "write":
+                for raw in rep.log.read_all():
+                    rec = normalize_replica_record(raw)
+                    if rec is None or rec["op"] != "write":
                         continue
                     conflict = tmp.apply_write(
                         rec["key"], rec["value"], rec["request_id"],
@@ -227,6 +256,67 @@ class Coordinator:
         with self._lock:
             return self.idem_table.get(idem_key)
 
+    def write_status(self, idem_key: str) -> dict | None:
+        """查询一次写入的收敛状态：成功/仍在等待、卡在哪一步、实时确认进度。
+
+        phase:
+        - succeeded: 已达多数派并提交；
+        - pending:   未达多数派，请求仍在等待收敛（可 resume / 对账续推）。
+        stuck_at 说明卡在哪一步：
+        - wait_replicas: 存活副本不足多数派，等待副本恢复；
+        - wait_acks:     已尽力复制但确认数不足，等待补复制推进。
+        """
+        with self._lock:
+            outcome = self.idem_table.get(idem_key)
+            if outcome is None:
+                return None
+            held_by: list[str] = []
+            committed_by: list[str] = []
+            unreachable: list[str] = []
+            for rep in self.replicas:
+                if not rep.alive:
+                    unreachable.append(rep.replica_id)
+                    continue
+                state = rep.data.get(outcome.key) if outcome.key else None
+                if state is not None and state.request_id == outcome.request_id:
+                    held_by.append(rep.replica_id)
+                    if state.committed:
+                        committed_by.append(rep.replica_id)
+            if outcome.code is CommitCode.COMMITTED:
+                phase, stuck_at = "succeeded", None
+            else:
+                phase = "pending"
+                stuck_at = (
+                    "wait_replicas"
+                    if outcome.code is CommitCode.NOT_ENOUGH_REPLICAS
+                    else "wait_acks"
+                )
+            status = {
+                "idem_key": idem_key,
+                "request_id": outcome.request_id,
+                "phase": phase,
+                "last_verdict": outcome.code.value,
+                "stuck_at": stuck_at,
+                "key": outcome.key,
+                "quorum": outcome.quorum or self.quorum,
+                "acked_replicas": list(outcome.acked),
+                "held_by": held_by,
+                "committed_by": committed_by,
+                "unreachable_replicas": unreachable,
+            }
+            status["basis"] = (
+                f"request_id={outcome.request_id} 当前在 "
+                f"{len(committed_by)}/{len(self.replicas)} 个副本上已提交"
+                f"（多数派需 {status['quorum']}），phase={phase}"
+                + (f"，卡在 {stuck_at}" if stuck_at else "")
+            )
+            print(
+                f"[status] request_id={outcome.request_id} idem_key={idem_key} "
+                f"phase={phase} committed_by={committed_by} "
+                f"basis={status['basis']}", flush=True,
+            )
+            return status
+
     def read_key(self, key: str) -> dict | None:
         """读取数据键当前值：同一 request_id 在多数存活副本上为已提交才可见。"""
         with self._lock:
@@ -340,7 +430,7 @@ class Coordinator:
         for rep in targets:
             try:
                 conflict = rep.apply_write(key, value, request_id, timestamp, False)
-            except (RuntimeError, IOError) as exc:
+            except (OSError, RuntimeError) as exc:
                 pending.append(rep.replica_id)
                 print(
                     f"[replicate] request_id={request_id} -> {rep.replica_id} "
@@ -364,7 +454,7 @@ class Coordinator:
                 continue
             try:
                 rep.mark_committed(key, request_id)
-            except (RuntimeError, IOError) as exc:
+            except (OSError, RuntimeError) as exc:
                 print(
                     f"[commit-marker] request_id={request_id} -> "
                     f"{rep.replica_id} FAILED: {exc}", flush=True,

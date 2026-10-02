@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from qrs.compat import normalize_replica_record, validate_recovered
 from qrs.models import CONFLICT_RULE, ConflictRecord
 from qrs.storage import JsonlLog
 
@@ -43,9 +44,18 @@ class Replica:
 
     # 恢复 -------------------------------------------------------------
     def recover(self) -> None:
-        """从本地 WAL 重放恢复状态（重复/乱序记录同样收敛）。"""
-        for rec in self.log.read_all():
-            op = rec.get("op")
+        """从本地 WAL 重放恢复状态（重复/乱序/旧格式记录同样收敛）。"""
+        skipped = 0
+        for raw in self.log.read_all():
+            rec = normalize_replica_record(raw)
+            if rec is None:
+                skipped += 1
+                print(
+                    f"[recover] replica={self.replica_id} 跳过无法识别的记录: "
+                    f"{raw}", flush=True,
+                )
+                continue
+            op = rec["op"]
             if op == "write":
                 self._ingest(
                     rec["key"], rec["value"], rec["request_id"],
@@ -55,6 +65,14 @@ class Replica:
                 state = self.data.get(rec["key"])
                 if state is not None and state.request_id == rec["request_id"]:
                     state.committed = True
+        validate_recovered(
+            len(self.data), len(self.seen_requests), f"replica:{self.replica_id}",
+        )
+        if skipped:
+            print(
+                f"[recover] replica={self.replica_id} skipped={skipped} "
+                f"basis=无法识别的记录不影响已确认数据", flush=True,
+            )
 
     # 复制写入 ----------------------------------------------------------
     def apply_write(
@@ -69,7 +87,7 @@ class Replica:
         if not self.alive:
             raise RuntimeError(f"replica {self.replica_id} is down")
         if self.fault_write:
-            raise IOError(f"replica {self.replica_id} injected write fault")
+            raise OSError(f"replica {self.replica_id} injected write fault")
         record = {
             "op": "write", "key": key, "value": value,
             "request_id": request_id, "timestamp": timestamp,

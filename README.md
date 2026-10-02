@@ -13,12 +13,18 @@ HTTP API (FastAPI, qrs/api.py)
 Coordinator (qrs/coordinator.py)
   ├─ 幂等表 idem_key → 首次判定（持久化到 coordinator.log）
   ├─ 多数派判定 / commit 标记发布 / 补复制 resume
+  ├─ 写入状态查询 write_status（phase / 卡点 / 实时确认进度）
   └─ 冲突历史收集
         │  复制写入（先 fsync WAL 再生效）
+        ▼
+Reconciler (qrs/reconcile.py) ── 自动对账：续推未决写入 + 补齐落后副本
+        │
         ▼
 Replica replica-0 ── replica-0.wal   (qrs/replica.py)
 Replica replica-1 ── replica-1.wal
 Replica replica-2 ── replica-2.wal
+
+compat (qrs/compat.py) ── 历史 v0 落盘格式的规范化与恢复校验
 ```
 
 - 持久化（`qrs/storage.py`）：每条记录一行 JSON，追加写后 `flush + fsync`；
@@ -63,6 +69,40 @@ Replica replica-2 ── replica-2.wal
    - 迟到/旧序写入按冲突规则落败，不覆盖已生效状态；更新的写入覆盖生效。
    - 副本重启只信任 WAL：重复记录、乱序记录重放后都收敛到同一状态。
 
+4. **自动对账（reconcile）**
+   - `POST /cluster/reconcile`（或 `cluster.reconcile()`）触发一轮对账，做两件事：
+     1. **续推未决写入**：幂等表中所有非 `COMMITTED` 的判定，在存活副本数
+        足够时自动 `resume` 推进到最终一致；条件不足则跳过并记日志说明；
+     2. **补齐落后副本**：把已提交写入按 LWW 全序补投到缺失/落后的副本，
+        并补写 `commit` 标记。
+   - 安全保证：同一 `request_id` 重复投递幂等不重复生效；副本上已有全序
+     更新的写入时跳过，**不覆盖已确认数据**；已提交数据只增不丢。
+   - 报告字段：`retried_requests`（续推的请求）、`repaired_replicas`
+     （被补齐的副本）、`skipped`（条件不足跳过的幂等键）、`converged`
+     （本轮后是否全部收敛）。
+   - 集群可以 `auto_reconcile=True` 启动：副本重启、写故障解除时自动触发
+     一轮对账，无需人工介入（默认关闭，保持既有行为）。
+
+5. **写入状态查询**
+   - `GET /writes/{idem_key}/status` 返回一次写入的收敛状态：
+     | 字段 | 含义 |
+     | --- | --- |
+     | `phase` | `succeeded`（已提交）/ `pending`（仍在等待收敛） |
+     | `stuck_at` | `wait_replicas`（存活副本不足）/ `wait_acks`（确认数不足），成功时为 `null` |
+     | `last_verdict` | 最近一次判定码（如 `QUORUM_FAILED`） |
+     | `held_by` / `committed_by` | 当前实时持有 / 已提交该写入的副本 |
+     | `unreachable_replicas` | 当前不可达副本 |
+   - 未达多数派的写入在收敛前，读取入口（`GET /keys/{key}`）始终不可见。
+
+6. **历史数据兼容（v0 → v1）**
+   - 旧版落盘格式差异：副本 WAL 的 write 记录无 `op`/`committed` 字段；
+     协调者日志无 `pending`/`quorum`/`reason`/`replay`/`timestamp` 字段。
+   - 恢复时经 `qrs/compat.py` 规范化：缺 `op` 的记录按要素识别为 write；
+     缺 `committed` 默认未提交；协调者记录缺 `quorum` 迁移为当前多数派；
+     无法识别的记录与半行损坏跳过并记日志，不影响已确认数据。
+   - 兼容范围内语义不变：幂等键重放/拒绝、LWW 冲突规则、读取可见性判定
+     与查询结果在旧数据上与新数据一致；v0 的未决写入升级后可直接续推收敛。
+
 ## 冲突解决规则
 
 对同一数据键的不同写入，按确定的全序解决（LWW）：
@@ -82,9 +122,11 @@ Replica replica-2 ── replica-2.wal
 | --- | --- |
 | `POST /writes` | 提交写入，body: `idem_key,key,value,request_id,timestamp?` |
 | `GET  /writes/{idem_key}` | 查询幂等键的首次提交结果 |
+| `GET  /writes/{idem_key}/status` | 查询写入收敛状态（phase/卡点/实时确认进度） |
 | `POST /writes/{idem_key}/resume` | 对未达多数派的写入补复制 |
 | `GET  /keys/{key}` | 多数派视角读取数据键 |
 | `GET  /conflicts?key=...` | 查询冲突与解决结果 |
+| `POST /cluster/reconcile` | 触发一轮自动对账（续推未决写入 + 补齐落后副本） |
 | `POST /cluster/fail/{rid}` | 副本宕机注入 |
 | `POST /cluster/fault/{rid}` | 副本存活但写盘失败注入 |
 | `POST /cluster/clear-fault/{rid}` | 解除写盘故障 |
@@ -99,19 +141,23 @@ Replica replica-2 ── replica-2.wal
 
 单测/运行日志会打印判定所需三要素：**请求标识**（`request_id`）、
 **确认副本**（逐副本 `ACK/FAILED` 及汇总 `acked/pending`）、
-**判定依据**（`verdict=... basis=...`）。
+**判定依据**（`verdict=... basis=...`）。对账日志以 `[reconcile]` 前缀
+输出每轮的续推/补齐/跳过及依据，状态查询以 `[status]` 输出 phase 与
+实时确认进度，恢复校验以 `[recover]` 输出各节点重放摘要。
 
 ## 本地验证
 
 ```bash
 uv sync
-uv run pytest                 # 全部 23 个用例
-uv run pytest -s              # 同时查看逐请求协调日志
+uv run pytest                 # 全部 37 个用例
+uv run pytest -s              # 同时查看逐请求协调/对账日志
 uv run uvicorn main:app --reload
 # 然后：
 # curl -X POST localhost:8000/writes -H 'content-type: application/json' \
 #   -d '{"idem_key":"k1","key":"account-1","value":"100","request_id":"r1","timestamp":1}'
 # curl localhost:8000/keys/account-1
+# curl localhost:8000/writes/k1/status        # 写入收敛状态
+# curl -X POST localhost:8000/cluster/reconcile  # 手动触发一轮对账
 ```
 
 测试覆盖（`tests/`）：
@@ -126,3 +172,10 @@ uv run uvicorn main:app --reload
 宕机副本重启后补复制收敛、少数派残留重启后仍不可见。
 - `test_consistency.py`：HTTP 各入口结论一致；日志含请求标识、确认副本、判定依据；
   两类失败原因在日志中可区分。
+- `test_reconcile.py`：落后副本对账补齐、补投/重复投递幂等不覆盖已确认写入、
+  未达多数派写入的状态查询（pending/卡点/确认数）与对账自动收敛、
+  `auto_reconcile` 下副本恢复/故障解除即自动收敛、并发冲突写入经对账收敛到
+  同一 LWW 胜者、全量重启后对账不丢已提交数据。
+- `test_compat.py`：v0 旧格式落盘数据启动可读、幂等重放/拒绝语义保持、
+  恢复后不重复生效、旧状态参与 LWW 冲突规则、无法识别记录与半行损坏跳过、
+  v0 未决写入升级后状态可查并可续推收敛。

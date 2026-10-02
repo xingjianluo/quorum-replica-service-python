@@ -91,6 +91,13 @@ def create_app(cluster: Cluster | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"未知幂等键: {idem_key}")
         return _outcome_dict(outcome)
 
+    @app.get("/writes/{idem_key}/status")
+    def write_status(idem_key: str) -> dict[str, Any]:
+        status = coord().write_status(idem_key)
+        if status is None:
+            raise HTTPException(status_code=404, detail=f"未知幂等键: {idem_key}")
+        return status
+
     @app.post("/writes/{idem_key}/resume")
     def resume_write(idem_key: str) -> JSONResponse:
         try:
@@ -157,6 +164,16 @@ def create_app(cluster: Cluster | None = None) -> FastAPI:
             "status": "restarted",
             "idem_keys": len(c.idem_table),
             "conflicts": len(c.conflicts),
+        }
+
+    @app.post("/cluster/reconcile")
+    def reconcile() -> dict[str, Any]:
+        report = app.state.cluster.reconcile()
+        return {
+            "retried_requests": report.retried_requests,
+            "repaired_replicas": report.repaired_replicas,
+            "skipped": report.skipped,
+            "converged": report.converged,
         }
 
     @app.get("/cluster")
