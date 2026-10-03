@@ -2,7 +2,9 @@
 
 对账循环做两件事：
 1. 对幂等表中尚未 COMMITTED 的写入，条件具备（存活副本足够）时自动
-   resume 推进到最终一致；条件不足则跳过并说明原因；
+   resume 推进到最终一致；条件不足则跳过并说明原因。若同数据键已有
+   另一笔已提交写入，该未决写入被判 SUPERSEDED 终态失败：不改判成功、
+   不补投、不在副本上留下已提交痕迹；
 2. 对已提交的写入，按 LWW 全序把获胜的已提交状态补投到缺失/落后的副本：
    - 同一 request_id 重复投递是幂等 no-op（副本去重），不会重复生效；
    - 副本上已有全序更新的写入时跳过，绝不覆盖已确认的数据；
@@ -21,6 +23,7 @@ class ReconcileReport:
     retried_requests: list[str] = field(default_factory=list)   # 自动续推的 request_id
     repaired_replicas: list[str] = field(default_factory=list)  # 被补齐的副本
     skipped: list[str] = field(default_factory=list)            # 条件不足跳过的幂等键
+    superseded: list[str] = field(default_factory=list)         # 被判取代（终态失败）的幂等键
     converged: bool = False                                     # 本轮后是否全部收敛
 
 
@@ -40,7 +43,8 @@ class Reconciler:
         print(
             f"[reconcile] === round end: retried={report.retried_requests} "
             f"repaired={report.repaired_replicas} skipped={report.skipped} "
-            f"converged={report.converged} ===", flush=True,
+            f"superseded={report.superseded} converged={report.converged} ===",
+            flush=True,
         )
         return report
 
@@ -48,7 +52,8 @@ class Reconciler:
     def _retry_pending(self, report: ReconcileReport) -> None:
         coord = self.coordinator
         for idem_key, outcome in list(coord.idem_table.items()):
-            if outcome.code is CommitCode.COMMITTED:
+            # SUPERSEDED 与 COMMITTED 同为终态：不再续推
+            if outcome.code in (CommitCode.COMMITTED, CommitCode.SUPERSEDED):
                 continue
             alive = [r for r in coord.replicas if r.alive]
             if len(alive) < coord.quorum:
@@ -61,6 +66,15 @@ class Reconciler:
                 )
                 continue
             result = coord.resume(idem_key)
+            if result.code is CommitCode.SUPERSEDED:
+                # 同键已有更新的已提交写入：终态失败，不得改判成功
+                report.superseded.append(idem_key)
+                print(
+                    f"[reconcile] request_id={result.request_id} "
+                    f"idem_key={idem_key} verdict=SUPERSEDED "
+                    f"basis={result.reason}", flush=True,
+                )
+                continue
             report.retried_requests.append(result.request_id)
             print(
                 f"[reconcile] request_id={result.request_id} idem_key={idem_key} "
@@ -136,7 +150,9 @@ class Reconciler:
     def _check_converged(self) -> bool:
         coord = self.coordinator
         outcomes = list(coord.idem_table.values())
-        if any(o.code is not CommitCode.COMMITTED for o in outcomes):
+        # SUPERSEDED 是终态失败（已被取代，无需再推进），不阻碍收敛判定
+        if any(o.code not in (CommitCode.COMMITTED, CommitCode.SUPERSEDED)
+               for o in outcomes):
             return False
         # 每个数据键的 LWW 获胜写入，须在所有存活副本上为已提交状态
         winners: dict[str, tuple[int, str]] = {}

@@ -18,7 +18,7 @@ SCHEMA_VERSION = 1
 # 协调者日志中允许出现的判定码（与 models.CommitCode 对齐，独立保存以避免循环依赖）
 _KNOWN_CODES = {
     "COMMITTED", "REPLAYED", "CONTENT_MISMATCH",
-    "QUORUM_FAILED", "NOT_ENOUGH_REPLICAS",
+    "QUORUM_FAILED", "NOT_ENOUGH_REPLICAS", "SUPERSEDED",
 }
 
 

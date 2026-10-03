@@ -30,6 +30,7 @@ _CODE_TO_HTTP = {
     CommitCode.CONTENT_MISMATCH: 409,
     CommitCode.QUORUM_FAILED: 504,
     CommitCode.NOT_ENOUGH_REPLICAS: 503,
+    CommitCode.SUPERSEDED: 409,
 }
 
 
@@ -85,11 +86,14 @@ def create_app(cluster: Cluster | None = None) -> FastAPI:
         )
 
     @app.get("/writes/{idem_key}")
-    def query_write(idem_key: str) -> dict[str, Any]:
+    def query_write(idem_key: str) -> JSONResponse:
         outcome = coord().get(idem_key)
         if outcome is None:
             raise HTTPException(status_code=404, detail=f"未知幂等键: {idem_key}")
-        return _outcome_dict(outcome)
+        return JSONResponse(
+            status_code=_CODE_TO_HTTP[outcome.code],
+            content=_outcome_dict(outcome),
+        )
 
     @app.get("/writes/{idem_key}/status")
     def write_status(idem_key: str) -> dict[str, Any]:
@@ -173,6 +177,7 @@ def create_app(cluster: Cluster | None = None) -> FastAPI:
             "retried_requests": report.retried_requests,
             "repaired_replicas": report.repaired_replicas,
             "skipped": report.skipped,
+            "superseded": report.superseded,
             "converged": report.converged,
         }
 

@@ -22,11 +22,13 @@ class Cluster:
         self,
         base_dir: str | None = None,
         n: int = 3,
-        auto_reconcile: bool = False,
+        auto_reconcile: bool = True,
     ) -> None:
         self.base_dir = base_dir or tempfile.mkdtemp(prefix="qrs-")
         self.n = n
-        # 开启后：副本重启/故障解除时自动触发一轮对账，无需人工介入
+        # 默认开启：副本重启恢复/写故障解除/协调者重启时自动触发一轮对账，
+        # 无需人工介入即可补齐缺口、推进未达多数派的写入到最终一致；
+        # 传 False 可关闭（测试手动对账场景）。
         self.auto_reconcile = auto_reconcile
         os.makedirs(self.base_dir, exist_ok=True)
         self.replicas: list[Replica] = []
@@ -100,6 +102,7 @@ class Cluster:
             f"{len(self.coordinator.idem_table)} idem keys / "
             f"{len(self.coordinator.conflicts)} conflicts", flush=True,
         )
+        self._maybe_auto_reconcile("coordinator-restarted")
         return self.coordinator
 
     def cleanup(self) -> None:

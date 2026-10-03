@@ -12,8 +12,9 @@ from qrs.cluster import Cluster
 
 @pytest.fixture()
 def cluster():
+    # 显式关闭自动对账：这些用例需要手动控制对账/恢复时机
     base_dir = tempfile.mkdtemp(prefix="qrs-test-")
-    cl = Cluster(base_dir=base_dir, n=3)
+    cl = Cluster(base_dir=base_dir, n=3, auto_reconcile=False)
     yield cl
     cl.cleanup()
 
