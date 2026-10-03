@@ -4,7 +4,9 @@
 1. 幂等：同一 idem_key 的首次判定持久化到协调者本地日志，重复提交要么返回
    首次结果（内容一致），要么被拒绝（CONTENT_MISMATCH，可区分原因）。
 2. 多数派：仅当多数副本确认持久化后才写入 commit 标记并对外返回成功；
-   存活不足与尽力复制后仍未达多数派返回不同错误码。
+   存活不足与尽力复制后仍未达多数派返回不同错误码。续推（resume）时
+   以"副本当前生效状态就是本写入"为确认标准：若同键已有更新的已提交
+   写入生效，未决写入终态判定为 SUPERSEDED（失败），绝不改判成功。
 3. 冲突：复制中按 LWW(timestamp, request_id) 全序解决，冲突记录集中保存，
    败方不静默丢弃；重启后重放收敛。
 """
@@ -202,40 +204,66 @@ class Coordinator:
             return outcome
 
     def resume(self, idem_key: str) -> CommitOutcome:
-        """对已部分生效但未达多数派的写入继续补复制，驱动收敛。"""
+        """对已部分生效但未达多数派的写入继续补复制，驱动收敛。
+
+        终态保护：若同数据键已有全序更新的已提交写入生效，本写入已不可能
+        再成为可见值，直接终态判定为 SUPERSEDED（失败），不再复制、
+        不发布 commit 标记，绝不改判为成功。
+        """
         with self._key_lock(idem_key):
             stored = self.idem_table.get(idem_key)
             if stored is None:
                 raise KeyError(f"未知幂等键: {idem_key}")
-            if stored.code is CommitCode.COMMITTED:
-                return stored
+            if stored.code in (CommitCode.COMMITTED, CommitCode.SUPERSEDED):
+                return stored  # 终态：成功或被取代都不再推进
             key = stored.key or self._stored_key(idem_key) or ""
             value = stored.value
+            ts = stored.timestamp or 0
+
+            winner = self._superseded_by(key, ts, stored.request_id)
+            if winner is not None:
+                return self._finalize_superseded(stored, winner)
 
             alive = [r for r in self.replicas if r.alive]
             acked, pending, conflicts = self._replicate(
-                alive, key, value, stored.request_id, stored.timestamp or 0,
+                alive, key, value, stored.request_id, ts,
             )
             self._record_conflicts(conflicts)
+            # 生效确认数：副本当前生效状态就是本写入（ACK 只表示落盘，
+            # 若副本上已有更新写入，本写入按 LWW 落败，不能算确认）
+            confirmed = [
+                r.replica_id for r in alive
+                if (state := r.data.get(key)) is not None
+                and state.request_id == stored.request_id
+            ]
             print(
                 f"[resume] request_id={stored.request_id} acked={acked} "
-                f"pending={pending} quorum={stored.quorum}", flush=True,
+                f"pending={pending} confirmed={confirmed} "
+                f"quorum={stored.quorum}", flush=True,
             )
 
-            if len(acked) >= stored.quorum:
-                self._publish_commit(key, stored.request_id, acked)
+            if len(confirmed) >= stored.quorum:
+                self._publish_commit(key, stored.request_id, confirmed)
                 upgraded = CommitOutcome(
                     idem_key=idem_key, code=CommitCode.COMMITTED,
                     request_id=stored.request_id, key=key, value=value,
                     timestamp=stored.timestamp, acked=acked,
                     pending=pending, quorum=stored.quorum,
                     reason=(
-                        f"补复制后 {len(acked)}/{len(self.replicas)} 个副本确认，"
-                        f"达到多数派 {stored.quorum}"
+                        f"补复制后 {len(confirmed)}/{len(self.replicas)} 个副本"
+                        f"以本写入为当前生效状态，达到多数派 {stored.quorum}"
                     ),
                 )
                 self._persist_outcome(upgraded)
+                print(
+                    f"[resume] request_id={stored.request_id} verdict=COMMITTED "
+                    f"basis={upgraded.reason}", flush=True,
+                )
                 return upgraded
+
+            winner = self._superseded_by(key, ts, stored.request_id)
+            if winner is not None:
+                return self._finalize_superseded(stored, winner)
 
             failed = CommitOutcome(
                 idem_key=idem_key,
@@ -245,9 +273,16 @@ class Coordinator:
                 request_id=stored.request_id, key=key, value=value,
                 timestamp=stored.timestamp, acked=acked,
                 pending=pending, quorum=stored.quorum,
-                reason="补复制后仍未达到多数派",
+                reason=(
+                    f"补复制后仅 {len(confirmed)}/{len(self.replicas)} 个副本"
+                    f"以本写入为当前生效状态，仍未达到多数派 {stored.quorum}"
+                ),
             )
             self._persist_outcome(failed)
+            print(
+                f"[resume] request_id={stored.request_id} "
+                f"verdict={failed.code.value} basis={failed.reason}", flush=True,
+            )
             return failed
 
     # 查询 -------------------------------------------------------------
@@ -257,12 +292,14 @@ class Coordinator:
             return self.idem_table.get(idem_key)
 
     def write_status(self, idem_key: str) -> dict | None:
-        """查询一次写入的收敛状态：成功/仍在等待、卡在哪一步、实时确认进度。
+        """查询一次写入的收敛状态：成功/失败/仍在等待三态及实时确认进度。
 
         phase:
         - succeeded: 已达多数派并提交；
+        - failed:    终态失败，确定不会再生效。failure_reason 给出依据：
+                     superseded（已被同键更新的已提交写入取代）；
         - pending:   未达多数派，请求仍在等待收敛（可 resume / 对账续推）。
-        stuck_at 说明卡在哪一步：
+        stuck_at 说明等待中的写入卡在哪一步：
         - wait_replicas: 存活副本不足多数派，等待副本恢复；
         - wait_acks:     已尽力复制但确认数不足，等待补复制推进。
         """
@@ -282,21 +319,38 @@ class Coordinator:
                     held_by.append(rep.replica_id)
                     if state.committed:
                         committed_by.append(rep.replica_id)
+
+            superseded_by = None
             if outcome.code is CommitCode.COMMITTED:
-                phase, stuck_at = "succeeded", None
+                phase, stuck_at, failure_reason = "succeeded", None, None
             else:
-                phase = "pending"
-                stuck_at = (
-                    "wait_replicas"
-                    if outcome.code is CommitCode.NOT_ENOUGH_REPLICAS
-                    else "wait_acks"
+                # 动态检测：即使尚未续推终态化，只要同键已有更新的已提交
+                # 写入生效，本写入就已不可能再收敛，如实反映为失败
+                winner = self._superseded_by(
+                    outcome.key, outcome.timestamp or 0, outcome.request_id,
                 )
+                if outcome.code is CommitCode.SUPERSEDED or winner is not None:
+                    phase, stuck_at = "failed", None
+                    failure_reason = "superseded"
+                    superseded_by = (
+                        winner.request_id if winner is not None else None
+                    )
+                else:
+                    phase = "pending"
+                    failure_reason = None
+                    stuck_at = (
+                        "wait_replicas"
+                        if outcome.code is CommitCode.NOT_ENOUGH_REPLICAS
+                        else "wait_acks"
+                    )
             status = {
                 "idem_key": idem_key,
                 "request_id": outcome.request_id,
                 "phase": phase,
                 "last_verdict": outcome.code.value,
                 "stuck_at": stuck_at,
+                "failure_reason": failure_reason,
+                "superseded_by": superseded_by,
                 "key": outcome.key,
                 "quorum": outcome.quorum or self.quorum,
                 "acked_replicas": list(outcome.acked),
@@ -304,12 +358,23 @@ class Coordinator:
                 "committed_by": committed_by,
                 "unreachable_replicas": unreachable,
             }
-            status["basis"] = (
-                f"request_id={outcome.request_id} 当前在 "
-                f"{len(committed_by)}/{len(self.replicas)} 个副本上已提交"
-                f"（多数派需 {status['quorum']}），phase={phase}"
-                + (f"，卡在 {stuck_at}" if stuck_at else "")
-            )
+            if phase == "failed":
+                basis = (
+                    f"request_id={outcome.request_id} 终态失败："
+                    f"仅 {len(held_by)}/{len(self.replicas)} 个副本持有"
+                    f"（确认数不足多数派 {status['quorum']}）"
+                )
+                if superseded_by:
+                    basis += f"，且已被更新的已提交写入 {superseded_by} 取代"
+                basis += "，确定不再生效"
+            else:
+                basis = (
+                    f"request_id={outcome.request_id} 当前在 "
+                    f"{len(committed_by)}/{len(self.replicas)} 个副本上已提交"
+                    f"（多数派需 {status['quorum']}），phase={phase}"
+                    + (f"，卡在 {stuck_at}" if stuck_at else "")
+                )
+            status["basis"] = basis
             print(
                 f"[status] request_id={outcome.request_id} idem_key={idem_key} "
                 f"phase={phase} committed_by={committed_by} "
@@ -459,6 +524,49 @@ class Coordinator:
                     f"[commit-marker] request_id={request_id} -> "
                     f"{rep.replica_id} FAILED: {exc}", flush=True,
                 )
+
+    def _superseded_by(
+        self, key: str, timestamp: int, request_id: str,
+    ) -> CommitOutcome | None:
+        """若同数据键已存在全序更新的已提交写入，返回该写入（本写入已被取代）。"""
+        if not key:
+            return None
+        for other in self.idem_table.values():
+            if (other.code is CommitCode.COMMITTED and other.key == key
+                    and (other.timestamp or 0, other.request_id)
+                    > (timestamp, request_id)):
+                return other
+        return None
+
+    def _finalize_superseded(
+        self, stored: CommitOutcome, winner: CommitOutcome,
+    ) -> CommitOutcome:
+        """把已被更新已提交写入取代的未决写入终态判定为 SUPERSEDED。"""
+        held_by = [
+            r.replica_id for r in self.replicas if r.alive
+            and (state := r.data.get(stored.key)) is not None
+            and state.request_id == stored.request_id
+        ]
+        outcome = CommitOutcome(
+            idem_key=stored.idem_key, code=CommitCode.SUPERSEDED,
+            request_id=stored.request_id, key=stored.key,
+            value=stored.value, timestamp=stored.timestamp,
+            acked=list(stored.acked), pending=list(stored.pending),
+            quorum=stored.quorum,
+            reason=(
+                f"仅 {len(held_by)}/{len(self.replicas)} 个副本仍持有本写入"
+                f"（确认数不足多数派 {stored.quorum}），且同键已有更新的已提交写入 "
+                f"{winner.request_id}@ts={winner.timestamp} 生效；"
+                f"本写入被取代，确定不再生效，不发布 commit 标记"
+            ),
+        )
+        self._persist_outcome(outcome)
+        print(
+            f"[resume] request_id={stored.request_id} verdict=SUPERSEDED "
+            f"superseded_by={winner.request_id} held_by={held_by} "
+            f"basis={outcome.reason}", flush=True,
+        )
+        return outcome
 
     def _record_conflicts(self, conflicts: list[ConflictRecord]) -> None:
         with self._lock:

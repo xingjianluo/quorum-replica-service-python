@@ -26,11 +26,11 @@ def auto_client(auto_cluster):
         yield c
 
 
-def test_reconcile_repairs_lagging_replica(client: TestClient) -> None:
+def test_reconcile_repairs_lagging_replica(manual_client: TestClient) -> None:
     """副本宕机错过写入，回来后经对账补齐到相同的已提交状态。"""
-    cluster = client.app.state.cluster
+    cluster = manual_client.app.state.cluster
     cluster.fail_replica("replica-2")
-    body = client.post("/writes", json={
+    body = manual_client.post("/writes", json={
         "idem_key": "ik-1", "key": "k1", "value": "v1",
         "request_id": "req-1", "timestamp": 1,
     }).json()
@@ -49,11 +49,11 @@ def test_reconcile_repairs_lagging_replica(client: TestClient) -> None:
         assert (s.value, s.request_id, s.committed) == ("v1", "req-1", True)
 
 
-def test_reconcile_duplicate_delivery_is_idempotent(client: TestClient) -> None:
+def test_reconcile_duplicate_delivery_is_idempotent(manual_client: TestClient) -> None:
     """对账补投 + 重复投递同一请求：不重复生效、不盖掉已确认写入。"""
-    cluster = client.app.state.cluster
+    cluster = manual_client.app.state.cluster
     cluster.fail_replica("replica-2")
-    client.post("/writes", json={
+    manual_client.post("/writes", json={
         "idem_key": "ik-1", "key": "k1", "value": "v1",
         "request_id": "req-1", "timestamp": 1,
     })
@@ -80,18 +80,18 @@ def test_reconcile_duplicate_delivery_is_idempotent(client: TestClient) -> None:
     assert lagging.get("k1").value == "v1"
 
 
-def test_pending_write_converges_via_reconcile(client: TestClient) -> None:
+def test_pending_write_converges_via_reconcile(manual_client: TestClient) -> None:
     """未达多数派的写入：状态可查（pending/卡点/确认数），条件恢复后对账自动收敛。"""
-    client.post("/cluster/fault/replica-1")
-    client.post("/cluster/fault/replica-2")
-    r = client.post("/writes", json={
+    manual_client.post("/cluster/fault/replica-1")
+    manual_client.post("/cluster/fault/replica-2")
+    r = manual_client.post("/writes", json={
         "idem_key": "ik-p", "key": "kp", "value": "vp",
         "request_id": "req-p", "timestamp": 1,
     })
     assert r.status_code == 504
 
     # 状态查询：仍在等待、卡在确认不足、只有 1 个副本持有
-    st = client.get("/writes/ik-p/status").json()
+    st = manual_client.get("/writes/ik-p/status").json()
     assert st["phase"] == "pending"
     assert st["stuck_at"] == "wait_acks"
     assert st["last_verdict"] == CommitCode.QUORUM_FAILED.value
@@ -99,22 +99,22 @@ def test_pending_write_converges_via_reconcile(client: TestClient) -> None:
     assert st["committed_by"] == []
     assert st["quorum"] == 2
     # 未确认内容读取入口不可见
-    assert client.get("/keys/kp").json()["visible"] is False
+    assert manual_client.get("/keys/kp").json()["visible"] is False
 
     # 条件恢复后对账自动推进到最终一致
-    client.post("/cluster/clear-fault/replica-1")
-    client.post("/cluster/clear-fault/replica-2")
-    report = client.post("/cluster/reconcile").json()
+    manual_client.post("/cluster/clear-fault/replica-1")
+    manual_client.post("/cluster/clear-fault/replica-2")
+    report = manual_client.post("/cluster/reconcile").json()
     assert "req-p" in report["retried_requests"]
     assert report["converged"] is True
 
-    st2 = client.get("/writes/ik-p/status").json()
+    st2 = manual_client.get("/writes/ik-p/status").json()
     assert st2["phase"] == "succeeded"
     assert st2["stuck_at"] is None
     assert len(st2["committed_by"]) >= 2
-    assert client.get("/keys/kp").json()["visible"] is True
+    assert manual_client.get("/keys/kp").json()["visible"] is True
     # 查询入口结论同步升级为 COMMITTED
-    assert client.get("/writes/ik-p").json()["code"] == CommitCode.COMMITTED.value
+    assert manual_client.get("/writes/ik-p").json()["code"] == CommitCode.COMMITTED.value
 
 
 def test_status_distinguishes_wait_replicas(client: TestClient) -> None:
@@ -167,35 +167,35 @@ def test_auto_reconcile_converges_pending_write(auto_client: TestClient) -> None
     assert auto_client.get("/keys/kap").json()["visible"] is True
 
 
-def test_reconcile_after_full_restart_keeps_committed_data(client: TestClient) -> None:
+def test_reconcile_after_full_restart_keeps_committed_data(manual_client: TestClient) -> None:
     """重启恢复 + 对账：已提交数据不丢、不重复生效，少数派残留不被当成已提交。"""
-    cluster = client.app.state.cluster
-    client.post("/writes", json={
+    cluster = manual_client.app.state.cluster
+    manual_client.post("/writes", json={
         "idem_key": "ik-1", "key": "k1", "value": "v1",
         "request_id": "req-1", "timestamp": 1,
     })
     # 另一笔写入只落到少数派（未达多数派）
-    client.post("/cluster/fault/replica-1")
-    client.post("/cluster/fault/replica-2")
-    client.post("/writes", json={
+    manual_client.post("/cluster/fault/replica-1")
+    manual_client.post("/cluster/fault/replica-2")
+    manual_client.post("/writes", json={
         "idem_key": "ik-2", "key": "k2", "value": "minority",
         "request_id": "req-2", "timestamp": 2,
     })
-    client.post("/cluster/clear-fault/replica-1")
-    client.post("/cluster/clear-fault/replica-2")
+    manual_client.post("/cluster/clear-fault/replica-1")
+    manual_client.post("/cluster/clear-fault/replica-2")
 
     for rid in ("replica-0", "replica-1", "replica-2"):
-        client.post(f"/cluster/restart/{rid}")
-    client.post("/cluster/restart-coordinator")
+        manual_client.post(f"/cluster/restart/{rid}")
+    manual_client.post("/cluster/restart-coordinator")
 
     # 重启后已提交数据仍在，少数派残留不可见
-    assert client.get("/keys/k1").json()["visible"] is True
-    assert client.get("/keys/k2").json()["visible"] is False
+    assert manual_client.get("/keys/k1").json()["visible"] is True
+    assert manual_client.get("/keys/k2").json()["visible"] is False
 
-    report = client.post("/cluster/reconcile").json()
+    report = manual_client.post("/cluster/reconcile").json()
     assert report["converged"] is True
     # ik-2 被自动续推为已提交；ik-1 不重复生效（各副本仍只有一条生效记录）
-    assert client.get("/writes/ik-2").json()["code"] == CommitCode.COMMITTED.value
+    assert manual_client.get("/writes/ik-2").json()["code"] == CommitCode.COMMITTED.value
     for rep in cluster.replicas:
         assert rep.get("k1").request_id == "req-1"
         assert rep.get("k2").request_id == "req-2"

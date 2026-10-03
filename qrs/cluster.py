@@ -22,11 +22,12 @@ class Cluster:
         self,
         base_dir: str | None = None,
         n: int = 3,
-        auto_reconcile: bool = False,
+        auto_reconcile: bool = True,
     ) -> None:
         self.base_dir = base_dir or tempfile.mkdtemp(prefix="qrs-")
         self.n = n
-        # 开启后：副本重启/故障解除时自动触发一轮对账，无需人工介入
+        # 默认开启自愈：副本重启恢复/写故障解除时自动触发一轮对账，
+        # 无需人工介入；显式传 False 可回到纯手动对账模式
         self.auto_reconcile = auto_reconcile
         os.makedirs(self.base_dir, exist_ok=True)
         self.replicas: list[Replica] = []

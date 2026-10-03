@@ -12,6 +12,7 @@ class CommitCode(str, Enum):
     CONTENT_MISMATCH = "CONTENT_MISMATCH"        # 同幂等键但内容不同
     QUORUM_FAILED = "QUORUM_FAILED"              # 已尽力复制但未达多数派
     NOT_ENOUGH_REPLICAS = "NOT_ENOUGH_REPLICAS"  # 存活副本数本身不足多数派
+    SUPERSEDED = "SUPERSEDED"                    # 未达多数派，且已被同键更新的已提交写入取代（终态失败）
 
 
 @dataclass

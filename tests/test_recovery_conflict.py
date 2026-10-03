@@ -102,26 +102,26 @@ def test_conflict_queryable_after_full_restart(client: TestClient) -> None:
     assert client.get("/keys/k1").json()["value"] == "v2"
 
 
-def test_minority_residue_not_visible_after_restart(client: TestClient) -> None:
+def test_minority_residue_not_visible_after_restart(manual_client: TestClient) -> None:
     """未达多数派的写入重启后仍是少数派残留，不可见。"""
-    client.post("/cluster/fault/replica-1")
-    client.post("/cluster/fault/replica-2")
-    client.post("/writes", json={
+    manual_client.post("/cluster/fault/replica-1")
+    manual_client.post("/cluster/fault/replica-2")
+    manual_client.post("/writes", json={
         "idem_key": "ik-fail", "key": "k1", "value": "minority",
         "request_id": "req-fail", "timestamp": 1,
     })
     # 全部重启，replica-0 上的残留依然存在但不应被读为可见
     for rid in ("replica-0", "replica-1", "replica-2"):
-        client.post(f"/cluster/restart/{rid}")
-    client.post("/cluster/restart-coordinator")
-    read = client.get("/keys/k1").json()
+        manual_client.post(f"/cluster/restart/{rid}")
+    manual_client.post("/cluster/restart-coordinator")
+    read = manual_client.get("/keys/k1").json()
     assert read["visible"] is False
     assert read["committed_replicas"] == []
     # 补复制后收敛可见
-    client.post("/cluster/clear-fault/replica-1")
-    client.post("/cluster/clear-fault/replica-2")
-    client.post("/writes/ik-fail/resume")
-    assert client.get("/keys/k1").json()["visible"] is True
+    manual_client.post("/cluster/clear-fault/replica-1")
+    manual_client.post("/cluster/clear-fault/replica-2")
+    manual_client.post("/writes/ik-fail/resume")
+    assert manual_client.get("/keys/k1").json()["visible"] is True
 
 
 def test_concurrent_conflicting_writes_resolve_deterministically(client: TestClient) -> None:

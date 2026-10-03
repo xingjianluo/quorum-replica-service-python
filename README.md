@@ -60,9 +60,15 @@ compat (qrs/compat.py) ── 历史 v0 落盘格式的规范化与恢复校验
      | --- | --- | --- | --- |
      | 存活副本数本身 < 多数派 | `NOT_ENOUGH_REPLICAS` | 503 | 不具备提交条件 |
      | 存活够但 ACK 数 < 多数派 | `QUORUM_FAILED` | 504 | 尽力复制后仍未达多数派 |
+     | 未达多数派且已被同键更新的已提交写入取代 | `SUPERSEDED` | 409 | 终态失败，确定不再生效 |
    - 未达多数派的写入只可能残留在少数副本，状态被记录，可在故障恢复后用
      `POST /writes/{idem_key}/resume` 补复制；达到多数派后判定升级为
      `COMMITTED`，历史判定以最终结果为准（同一幂等键仍只有一个结论）。
+   - **续推的确认标准**：`resume`/对账续推时，只有"副本当前生效状态就是
+     本写入"才算确认（副本落盘 ACK 但按 LWW 落败于更新写入的不算）。
+     若同数据键已存在全序更新的已提交写入，未决写入被终态判定为
+     `SUPERSEDED`：不再复制、不发布 commit 标记、绝不改判成功，
+     查询入口如实返回失败；该终态幂等，重启与再次对账都不会翻回。
 
 3. **重放收敛**
    - 同一 `request_id` 的写入重复投递是幂等 no-op（副本以 `request_id` 去重）。
@@ -71,27 +77,40 @@ compat (qrs/compat.py) ── 历史 v0 落盘格式的规范化与恢复校验
 
 4. **自动对账（reconcile）**
    - `POST /cluster/reconcile`（或 `cluster.reconcile()`）触发一轮对账，做两件事：
-     1. **续推未决写入**：幂等表中所有非 `COMMITTED` 的判定，在存活副本数
-        足够时自动 `resume` 推进到最终一致；条件不足则跳过并记日志说明；
+     1. **续推未决写入**：幂等表中所有非终态（非 `COMMITTED`/`SUPERSEDED`）
+        的判定，在存活副本数足够时自动 `resume` 推进到最终一致；条件不足
+        则跳过并记日志说明。若同键已有更新的已提交写入生效，未决写入
+        被终态判定为 `SUPERSEDED`（记入报告的 `superseded` 字段），
+        不会被改判成功，也不会在副本上留下已提交痕迹；
      2. **补齐落后副本**：把已提交写入按 LWW 全序补投到缺失/落后的副本，
         并补写 `commit` 标记。
    - 安全保证：同一 `request_id` 重复投递幂等不重复生效；副本上已有全序
      更新的写入时跳过，**不覆盖已确认数据**；已提交数据只增不丢。
    - 报告字段：`retried_requests`（续推的请求）、`repaired_replicas`
-     （被补齐的副本）、`skipped`（条件不足跳过的幂等键）、`converged`
-     （本轮后是否全部收敛）。
-   - 集群可以 `auto_reconcile=True` 启动：副本重启、写故障解除时自动触发
-     一轮对账，无需人工介入（默认关闭，保持既有行为）。
+     （被补齐的副本）、`skipped`（条件不足跳过的幂等键）、`superseded`
+     （本轮终态判定为被取代的请求）、`converged`（本轮后是否全部收敛，
+     `SUPERSEDED` 属终态，不阻塞收敛）。
+   - **默认自愈**：集群默认 `auto_reconcile=True` 启动——副本重启恢复、
+     写故障解除时自动触发一轮对账，落后副本自动补齐、未达多数派的写入
+     自动推进到最终一致（或被终态判定为被取代），无需人工介入；
+     显式传 `auto_reconcile=False` 可回到纯手动对账模式（测试用手动
+     对账语义时使用）。
 
 5. **写入状态查询**
-   - `GET /writes/{idem_key}/status` 返回一次写入的收敛状态：
+   - `GET /writes/{idem_key}/status` 返回一次写入的收敛状态（三态）：
      | 字段 | 含义 |
      | --- | --- |
-     | `phase` | `succeeded`（已提交）/ `pending`（仍在等待收敛） |
-     | `stuck_at` | `wait_replicas`（存活副本不足）/ `wait_acks`（确认数不足），成功时为 `null` |
-     | `last_verdict` | 最近一次判定码（如 `QUORUM_FAILED`） |
+     | `phase` | `succeeded`（已提交）/ `failed`（终态失败，确定不再生效）/ `pending`（仍在等待收敛） |
+     | `stuck_at` | 等待中的卡点：`wait_replicas`（存活副本不足）/ `wait_acks`（确认数不足），非等待时为 `null` |
+     | `failure_reason` | 失败依据：`superseded`（已被同键更新的已提交写入取代），非失败时为 `null` |
+     | `superseded_by` | 取代本写入的已提交写入 `request_id`，无则 `null` |
+     | `last_verdict` | 最近一次判定码（如 `QUORUM_FAILED`/`SUPERSEDED`） |
      | `held_by` / `committed_by` | 当前实时持有 / 已提交该写入的副本 |
      | `unreachable_replicas` | 当前不可达副本 |
+     | `basis` | 可读判定依据（含请求标识、确认进度、取代/确认数不足等原因） |
+   - 失败是**终态**：被取代的写入即使尚未跑对账，状态查询也会动态检测
+     同键更新的已提交写入并如实返回 `failed`，不会出现"零副本持有却
+     报成功"的矛盾。
    - 未达多数派的写入在收敛前，读取入口（`GET /keys/{key}`）始终不可见。
 
 6. **历史数据兼容（v0 → v1）**
@@ -134,31 +153,59 @@ compat (qrs/compat.py) ── 历史 v0 落盘格式的规范化与恢复校验
 | `POST /cluster/restart-coordinator` | 重启协调者 |
 | `GET  /cluster` | 集群与各副本状态 |
 
-`COMMITTED/REPLAYED → 200`，`CONTENT_MISMATCH → 409`，
+`COMMITTED/REPLAYED → 200`，`CONTENT_MISMATCH/SUPERSEDED → 409`，
 `NOT_ENOUGH_REPLICAS → 503`，`QUORUM_FAILED → 504`。
 
 ## 日志
 
 单测/运行日志会打印判定所需三要素：**请求标识**（`request_id`）、
-**确认副本**（逐副本 `ACK/FAILED` 及汇总 `acked/pending`）、
-**判定依据**（`verdict=... basis=...`）。对账日志以 `[reconcile]` 前缀
-输出每轮的续推/补齐/跳过及依据，状态查询以 `[status]` 输出 phase 与
-实时确认进度，恢复校验以 `[recover]` 输出各节点重放摘要。
+**确认副本**（逐副本 `ACK/FAILED` 及汇总 `acked/pending/confirmed`）、
+**判定依据**（`verdict=... basis=...`，含 `SUPERSEDED` 的 `superseded_by=...`
+取代依据）。对账日志以 `[reconcile]` 前缀输出每轮的续推/补齐/跳过/取代及
+依据，状态查询以 `[status]` 输出 phase 与实时确认进度，恢复校验以
+`[recover]` 输出各节点重放摘要。
 
 ## 本地验证
 
 ```bash
 uv sync
-uv run pytest                 # 全部 37 个用例
+uv run pytest                 # 全部 45 个用例
 uv run pytest -s              # 同时查看逐请求协调/对账日志
 uv run uvicorn main:app --reload
 # 然后：
 # curl -X POST localhost:8000/writes -H 'content-type: application/json' \
 #   -d '{"idem_key":"k1","key":"account-1","value":"100","request_id":"r1","timestamp":1}'
 # curl localhost:8000/keys/account-1
-# curl localhost:8000/writes/k1/status        # 写入收敛状态
+# curl localhost:8000/writes/k1/status        # 写入收敛状态（成功/失败/等待三态）
 # curl -X POST localhost:8000/cluster/reconcile  # 手动触发一轮对账
 ```
+
+复现"被取代写入"场景（未达多数派的旧写入被同键更新的已提交写入顶掉）：
+
+```bash
+# 直接跑针对性用例，日志可见请求标识/确认副本/判定依据
+uv run pytest tests/test_superseded.py -s
+
+# 或用脚本逐步观察（手动对账模式，便于逐步注入故障）：
+uv run python - <<'EOF'
+from qrs.cluster import Cluster
+cl = Cluster(n=3, auto_reconcile=False)
+coord = cl.coordinator
+cl.inject_write_fault("replica-1"); cl.inject_write_fault("replica-2")
+coord.commit("old", "k", "v1", "r1", timestamp=1)   # 504：仅 replica-0 留存
+cl.clear_write_fault("replica-1"); cl.clear_write_fault("replica-2")
+coord.commit("new", "k", "v2", "r2", timestamp=2)   # 多数派提交，顶掉旧写入
+cl.reconcile()                                       # 旧写入被判 SUPERSEDED
+print(coord.get("old").code)                         # SUPERSEDED，而非 COMMITTED
+print(coord.write_status("old")["phase"])            # failed（三态之一）
+cl.cleanup()
+EOF
+```
+
+默认启动的服务（`auto_reconcile=True`）在故障解除/副本恢复的时机就会
+自动续推未决写入，因此"被取代"主要出现在：更新的写入先达成多数派、
+旧写入尚未续推的窗口（如手动对账模式或并发交错）。无论哪种路径，
+被取代的旧写入都不会被改判成功。
 
 测试覆盖（`tests/`）：
 
@@ -176,6 +223,11 @@ uv run uvicorn main:app --reload
   未达多数派写入的状态查询（pending/卡点/确认数）与对账自动收敛、
   `auto_reconcile` 下副本恢复/故障解除即自动收敛、并发冲突写入经对账收敛到
   同一 LWW 胜者、全量重启后对账不丢已提交数据。
+- `test_superseded.py`：同键更新的已提交写入生效后，未达多数派的旧写入续推
+  被判 `SUPERSEDED` 而非成功、零副本持有不报成功、落后副本上不留已提交痕迹；
+  状态查询成功/失败/等待三态区分与失败依据；`SUPERSEDED` 日志含请求标识/
+  确认进度/判定依据且终态跨协调者重启保持；默认启动下副本落后恢复、
+  故障解除后的自动收敛。
 - `test_compat.py`：v0 旧格式落盘数据启动可读、幂等重放/拒绝语义保持、
   恢复后不重复生效、旧状态参与 LWW 冲突规则、无法识别记录与半行损坏跳过、
   v0 未决写入升级后状态可查并可续推收敛。
